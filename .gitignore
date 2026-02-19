@@ -1,0 +1,33 @@
+# Environment — NEVER commit this
+.env
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Generated PDFs (temp output)
+*.pdf
+
+# Test files
+test_*.py
+test_output.*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Claude skill files
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
