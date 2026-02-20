@@ -71,10 +71,14 @@ def call_api(messages: list, max_tokens: int = 8000) -> str:
     raise ValueError(f"Unexpected API response format: {json.dumps(data)[:500]}")
 
 
-def generate_paper_content(title: str, pages: int, author_name: str = "Author", author_affil: str = "University") -> dict:
+def generate_paper_content(title: str, pages: int, author_name: str = "Author",
+                           author_affil: str = "University",
+                           anti_detection: bool = False) -> dict:
     """
     Call the AI API in two passes to generate a full IEEE research paper.
     Split into two calls to avoid max_token truncation on large papers.
+    anti_detection: if True, injects humanization rules into the system prompt
+    to reduce AI detection scores (GPTZero, Turnitin, etc).
     """
     # IEEE two-column A4 at 10pt Times Roman holds ~900 words of body text per page.
     # We add ~15% buffer since the AI under-produces relative to targets.
@@ -169,6 +173,18 @@ Return ONLY this JSON (no extra text):
   ]
 }}"""
 
+    humanize_rules = (
+        " HUMANIZATION RULES (apply to ALL text):"
+        " 1) Vary sentence length drastically — mix very short sentences (5-8 words) with longer ones (25-35 words)."
+        " 2) Occasionally start sentences with conjunctions: But, And, Yet, So, However."
+        " 3) Include rhetorical questions naturally, e.g. Why does this matter? or What does this mean in practice?"
+        " 4) Add hedging language: arguably, one might suggest, it appears that, in many cases."
+        " 5) Use active voice more than passive. Write confidently, not neutrally."
+        " 6) Vary paragraph length: some 2-sentence, some 5-sentence paragraphs."
+        " 7) Avoid starting consecutive sentences with the same word."
+        " 8) Use synonyms instead of repeating keywords."
+    ) if anti_detection else ""
+
     sys_msg = {
         "role": "system",
         "content": (
@@ -179,37 +195,84 @@ Return ONLY this JSON (no extra text):
             "CRITICAL: Do NOT use backslash characters inside any JSON string values. "
             "Do NOT use LaTeX notation. Write math as plain text. "
             "Do NOT use apostrophes or smart quotes inside JSON strings."
+            + humanize_rules
         )
     }
 
     logger.info("Generating paper part 1...")
-    raw1 = call_api([sys_msg, {"role": "user", "content": prompt1}], max_tokens=8000)
+    raw1 = call_api([sys_msg, {"role": "user", "content": prompt1}], max_tokens=16000)
     raw1 = re.sub(r"^```(?:json)?\s*", "", raw1.strip())
     raw1 = re.sub(r"\s*```$", "", raw1)
 
     logger.info("Generating paper part 2...")
-    raw2 = call_api([sys_msg, {"role": "user", "content": prompt2}], max_tokens=8000)
+    raw2 = call_api([sys_msg, {"role": "user", "content": prompt2}], max_tokens=16000)
     raw2 = re.sub(r"^```(?:json)?\s*", "", raw2.strip())
     raw2 = re.sub(r"\s*```$", "", raw2)
 
     def sanitize_json(raw: str) -> str:
         """
-        Fix invalid JSON escape sequences produced by AI models.
-        JSON only allows: \\" \\\\ \\/ \\b \\f \\n \\r \\t \\uXXXX
-        Any other backslash is invalid — double it so JSON sees a literal backslash.
+        Robust JSON sanitizer:
+        1. Strips invalid control characters (except \\n, \\r, \\t).
+        2. Escapes literal newlines/tabs inside strings (fixes 'Invalid control character').
+        3. Fixes invalid escape sequences (like \\_ or \\' or \\LaTeX).
         """
-        def fix_escape(m):
-            char = m.group(1)
-            if char in '"\\/' + 'bfnrt':
-                return m.group(0)  # valid — keep as-is
-            if char == 'u':
-                # \u must be followed by exactly 4 hex digits
-                after = raw[m.end():m.end()+4]
-                if len(after) == 4 and all(c in '0123456789abcdefABCDEF' for c in after):
-                    return m.group(0)  # valid \uXXXX — keep
-            # Invalid escape — double the backslash
-            return '\\\\' + char
-        return re.sub(r'\\(.)', fix_escape, raw)
+        # 1. Strip binary control characters (0-31) except 9(TAB), 10(LF), 13(CR)
+        raw = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', raw)
+
+        # 2. State machine to escape valid control chars (\\n, \\t) ONLY inside strings
+        #    and handle backslash logic
+        res = []
+        in_string = False
+        i = 0
+        length = len(raw)
+        
+        while i < length:
+            char = raw[i]
+            
+            # Check for quote (toggle string state)
+            if char == '"':
+                # Determine if this quote is escaped by counting preceding backslashes
+                bs_count = 0
+                j = i - 1
+                while j >= 0 and raw[j] == '\\':
+                    bs_count += 1
+                    j -= 1
+                
+                # If even backslashes, it's a real quote (unescaped)
+                if bs_count % 2 == 0:
+                    in_string = not in_string
+                res.append(char)
+            
+            elif char == '\n':
+                if in_string: res.append('\\n')
+                else:         res.append(char)  # keep structural newline
+                
+            elif char == '\t':
+                if in_string: res.append('\\t')
+                else:         res.append(char)  # keep structural tab
+                
+            elif char == '\r':
+                if not in_string: res.append(char) # skip CR inside strings
+                
+            elif char == '\\':
+                # 3. Handle backslashes
+                # If followed by a valid JSON escape char, keep it.
+                # If followed by invalid (like space, single quote, etc), double it.
+                if i + 1 < length:
+                    next_char = raw[i+1]
+                    if next_char in '"\\/bfnrtu':
+                        res.append(char) # valid start of escape
+                    else:
+                        res.append('\\\\') # invalid escape start -> escape the backslash
+                else:
+                    res.append('\\\\') # trailing backslash
+            
+            else:
+                res.append(char)
+                
+            i += 1
+            
+        return "".join(res)
 
     def parse_json_safe(raw: str, label: str) -> dict:
         """3-tier JSON parse: direct → sanitized → brace-extract+sanitized."""
@@ -222,12 +285,50 @@ Return ONLY this JSON (no extra text):
             return json.loads(sanitized)
         except json.JSONDecodeError:
             pass
-        match = re.search(r'\{.*\}', sanitized, re.DOTALL)
+    def repair_truncated_json(raw: str) -> str:
+        """Attempt to close truncated JSON strings or objects."""
+        raw = raw.strip()
+        # If text ends inside a string (odd number of unescaped quotes), close it
+        # This is a naive heuristic but works for most 'cut off mid-sentence' cases
+        quote_count = len(re.findall(r'(?<!\\)"', raw))
+        if quote_count % 2 != 0:
+            raw += '"'
+        
+        # Close open braces/brackets
+        open_braces = raw.count('{') - raw.count('}')
+        open_brackets = raw.count('[') - raw.count(']')
+        raw += '}' * open_braces
+        raw += ']' * open_brackets
+        return raw
+
+    def parse_json_safe(raw: str, label: str) -> dict:
+        """3-tier JSON parse: direct → sanitized → repaired → brace-extract."""
+        # 1. Try direct
+        try: return json.loads(raw)
+        except json.JSONDecodeError: pass
+
+        # 2. Try sanitizing escapes
+        sanitized = sanitize_json(raw)
+        try: return json.loads(sanitized)
+        except json.JSONDecodeError: pass
+
+        # 3. Try repairing truncation on the sanitized version
+        repaired = repair_truncated_json(sanitized)
+        try: return json.loads(repaired)
+        except json.JSONDecodeError: pass
+
+        # 4. Try extracting the largest brace block
+        match = re.search(r'\{.*\}', repaired, re.DOTALL)
         if match:
-            try:
-                return json.loads(match.group())
-            except json.JSONDecodeError as e:
-                raise ValueError(f"{label} JSON parse failed: {e}\nRaw: {sanitized[:500]}")
+            try: return json.loads(match.group())
+            except json.JSONDecodeError: pass
+        
+        # 5. Last ditch: try repair on the extracted block
+        if match:
+             try: return json.loads(repair_truncated_json(match.group()))
+             except json.JSONDecodeError as e:
+                 raise ValueError(f"{label} JSON parse failed: {e}\nRaw: {sanitized[:500]}")
+
         raise ValueError(f"{label} JSON parse failed — no JSON found.\nRaw: {raw[:400]}")
 
     part1 = parse_json_safe(raw1, "Part 1")

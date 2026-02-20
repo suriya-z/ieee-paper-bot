@@ -7,19 +7,24 @@ import logging
 import os
 import traceback
 
-from telegram import Update, ReplyKeyboardRemove
+from telegram import Update, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ConversationHandler,
     ContextTypes,
     filters,
 )
 
-from config import BOT_TOKEN
+from config import BOT_TOKEN, OWNER_ID
 from ai_content import generate_paper_content
 from pdf_generator import generate_ieee_pdf
+from premium import (
+    generate_key, redeem_key, is_premium, list_keys, delete_key,
+    FREE_PAGE_LIMIT
+)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -28,7 +33,18 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Conversation states
-TITLE, AUTHOR, PAGES = range(3)
+TITLE, AUTHOR, PAGES, MODE = range(4)
+
+
+def owner_only(func):
+    """Decorator: blocks non-owners with a silent rejection."""
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if update.effective_user.id != OWNER_ID:
+            await update.message.reply_text("⛔ This command is owner-only.")
+            return
+        return await func(update, context)
+    wrapper.__name__ = func.__name__
+    return wrapper
 
 # ─── Handlers ─────────────────────────────────────────────────────────────────
 
@@ -129,7 +145,7 @@ async def receive_author(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"🏛 {uni}\n"
         f"📍 {city}\n"
         f"📧 {email}\n\n"
-        f"📄 <b>Step 3 of 3:</b> How many pages should the paper be?\n"
+        f"📄 <b>Step 3 of 4:</b> How many pages should the paper be?\n"
         f"<i>(Enter a number between 4 and 20)</i>",
         parse_mode="HTML",
     )
@@ -217,14 +233,58 @@ async def receive_pages(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         )
         return PAGES
 
-    title       = context.user_data.get("title", "Research Paper")
-    author_name = context.user_data.get("author_name", "Author")
-    author_dept = context.user_data.get("author_dept", "Department of Engineering")
-    author_uni  = context.user_data.get("author_uni", "University")
-    author_city = context.user_data.get("author_city", "India")
-    author_email = context.user_data.get("author_email", f"{author_name.lower().replace(' ', '.')}@university.edu")
+    # Free users capping (Owner gets unlimited pages)
+    user_id = update.effective_user.id
+    has_premium = (user_id == OWNER_ID) or is_premium(user_id)
 
-    # Build a clean IEEE author dict — always override whatever the AI generates
+    if pages > FREE_PAGE_LIMIT and not has_premium:
+        await update.message.reply_text(
+            f"⛔ <b>Premium Required</b>\n\n"
+            f"Free users can generate up to <b>{FREE_PAGE_LIMIT} pages</b>.\n"
+            f"You requested <b>{pages} pages</b>.\n\n"
+            f"🔑 Redeem a premium key with:\n<code>/redeem SURIYA-XXXXXXXXXX</code>\n\n"
+            f"💬 Contact the owner to purchase a key.",
+            parse_mode="HTML",
+        )
+        return PAGES
+
+    context.user_data["pages"] = pages
+
+    # Show Anti-AI-detection mode selector
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🕵️ Anti-Detection: ON",  callback_data="antiai_on"),
+            InlineKeyboardButton("📄 Standard: OFF",        callback_data="antiai_off"),
+        ]
+    ])
+    await update.message.reply_text(
+        f"✅ <b>{pages} pages</b> selected!\n\n"
+        f"🕵️ <b>Step 4 of 4:</b> Anti-AI-Detection Mode\n"
+        f"<i>Humanizes the writing to reduce AI detection scores (GPTZero, Turnitin).</i>\n\n"
+        f"Choose a mode:",
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
+    return MODE
+
+
+async def receive_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle Anti-AI-detection mode button and run paper generation."""
+    query = update.callback_query
+    await query.answer()
+
+    anti_detection = (query.data == "antiai_on")
+    mode_label = "🕵️ Anti-Detection ON" if anti_detection else "📄 Standard Mode"
+
+    title        = context.user_data.get("title", "Research Paper")
+    pages        = context.user_data.get("pages", 6)
+    author_name  = context.user_data.get("author_name", "Author")
+    author_dept  = context.user_data.get("author_dept", "Department of Engineering")
+    author_uni   = context.user_data.get("author_uni", "University")
+    author_city  = context.user_data.get("author_city", "India")
+    author_email = context.user_data.get("author_email",
+                       f"{author_name.lower().replace(' ', '.')}@university.edu")
+
     clean_author = {
         "name":       author_name,
         "department": author_dept,
@@ -233,9 +293,13 @@ async def receive_pages(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         "email":      author_email,
     }
 
-    # Send initial status message with 0% bar
+    await query.edit_message_text(
+        f"✅ Mode: <b>{mode_label}</b>\n\n⚙️ Starting generation...",
+        parse_mode="HTML",
+    )
+
     bar0 = make_progress_bar(0)
-    status_msg = await update.message.reply_text(
+    status_msg = await query.message.reply_text(
         f"⚙️ <b>Generating IEEE Research Paper</b>\n\n"
         f"📌 <i>{title}</i>\n\n"
         f"🤖 AI Writing Paper...\n"
@@ -243,30 +307,23 @@ async def receive_pages(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         parse_mode="HTML",
     )
 
-    stop_event = asyncio.Event()
+    stop_event    = asyncio.Event()
     result_holder = [0]
-
-    # Start the animated progress bar as a background task
     progress_task = asyncio.create_task(
         animated_progress(status_msg, title, stop_event, result_holder)
     )
 
     pdf_path = None
     try:
-        # Run AI generation (this is the slow part)
         paper_data = await asyncio.get_event_loop().run_in_executor(
-            None, generate_paper_content, title, pages, author_name, author_uni
+            None, generate_paper_content, title, pages, author_name, author_uni, anti_detection
         )
-
-        # Always override the AI-generated authors with clean user-provided data
         paper_data["authors"] = [clean_author]
 
-        # Run PDF rendering
         pdf_path = await asyncio.get_event_loop().run_in_executor(
             None, generate_ieee_pdf, paper_data
         )
 
-        # Stop the progress bar and show 100%
         stop_event.set()
         await progress_task
 
@@ -283,22 +340,21 @@ async def receive_pages(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             pass
 
         await asyncio.sleep(0.5)
-
-        # Send the PDF
-        safe_title = "".join(c if c.isalnum() or c in " _-" else "_" for c in title)
-        safe_title = safe_title[:50].strip().replace(" ", "_")
-        filename = f"IEEE_{safe_title}.pdf"
-
         await status_msg.delete()
 
+        safe_title = "".join(c if c.isalnum() or c in " _-" else "_" for c in title)
+        safe_title = safe_title[:50].strip().replace(" ", "_")
+        filename   = f"IEEE_{safe_title}.pdf"
+
         with open(pdf_path, "rb") as pdf_file:
-            await update.message.reply_document(
+            await query.message.reply_document(
                 document=pdf_file,
                 filename=filename,
                 caption=(
                     f"✅ <b>Your IEEE Research Paper is ready!</b>\n\n"
                     f"📌 <b>Title:</b> {title}\n"
-                    f"📄 <b>Pages:</b> ~{pages}\n\n"
+                    f"📄 <b>Pages:</b> ~{pages}\n"
+                    f"🔒 <b>Mode:</b> {mode_label}\n\n"
                     f"🔁 Send /start to generate another paper."
                 ),
                 parse_mode="HTML",
@@ -320,7 +376,7 @@ async def receive_pages(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
                 parse_mode="HTML",
             )
         except Exception:
-            await update.message.reply_text(
+            await query.message.reply_text(
                 f"❌ Error: {err_msg[:200]}\n\nPlease try /start again."
             )
     finally:
@@ -378,7 +434,99 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
-# ─── Main ─────────────────────────────────────────────────────────────────────
+# ─── Owner commands ────────────────────────────────────────────────────────────
+
+@owner_only
+async def cmd_genkey(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Generate 1 or N premium keys. Usage: /genkey [count]"""
+    count = 1
+    if context.args:
+        try:
+            count = max(1, min(int(context.args[0]), 50))
+        except ValueError:
+            pass
+
+    keys = [generate_key() for _ in range(count)]
+    keys_text = "\n".join(f"<code>{k}</code>" for k in keys)
+    await update.message.reply_text(
+        f"🔑 <b>{count} Premium Key{'s' if count > 1 else ''} Generated:</b>\n\n{keys_text}",
+        parse_mode="HTML",
+    )
+
+
+@owner_only
+async def cmd_keys(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List all generated keys and their status."""
+    keys = list_keys()
+    if not keys:
+        await update.message.reply_text("📦 No keys generated yet. Use /genkey to create some.")
+        return
+
+    lines = []
+    for entry in keys:
+        status = f"✅ Used by <code>{entry['used_by']}</code>" if entry["used"] else "⚪️ Unused"
+        lines.append(f"<code>{entry['key']}</code> — {status}")
+
+    text = "\n".join(lines)
+    await update.message.reply_text(
+        f"📊 <b>All Premium Keys ({len(keys)}):</b>\n\n{text}",
+        parse_mode="HTML",
+    )
+
+
+@owner_only
+async def cmd_delkey(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Delete a key. Usage: /delkey SURIYA-XXXXXXXXXX"""
+    if not context.args:
+        await update.message.reply_text("Usage: <code>/delkey SURIYA-XXXXXXXXXX</code>", parse_mode="HTML")
+        return
+    key = context.args[0].strip().upper()
+    if delete_key(key):
+        await update.message.reply_text(f"✅ Key <code>{key}</code> deleted.", parse_mode="HTML")
+    else:
+        await update.message.reply_text(f"❌ Key <code>{key}</code> not found.", parse_mode="HTML")
+
+
+# ─── User commands ─────────────────────────────────────────────────────────────
+
+async def cmd_redeem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Redeem a premium key. Usage: /redeem SURIYA-XXXXXXXXXX"""
+    if not context.args:
+        await update.message.reply_text(
+            "🔑 <b>Redeem a Premium Key</b>\n\nUsage: <code>/redeem SURIYA-XXXXXXXXXX</code>",
+            parse_mode="HTML",
+        )
+        return
+    key = context.args[0].strip().upper()
+    user_id = update.effective_user.id
+    success, msg = redeem_key(key, user_id)
+    await update.message.reply_text(msg, parse_mode="HTML")
+
+
+async def cmd_premium(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Check premium status."""
+    user_id = update.effective_user.id
+    
+    if user_id == OWNER_ID:
+        await update.message.reply_text(
+            "👑 <b>Owner Access</b>\nYou have lifetime premium privileges.",
+            parse_mode="HTML",
+        )
+        return
+
+    if is_premium(user_id):
+        await update.message.reply_text(
+            "⭐ <b>You have Premium access!</b>\nYou can generate up to <b>20 pages</b>.",
+            parse_mode="HTML",
+        )
+    else:
+        await update.message.reply_text(
+            f"🔓 <b>Free account</b> — limited to <b>{FREE_PAGE_LIMIT} pages</b>.\n\n"
+            f"🔑 Redeem a key with: <code>/redeem SURIYA-XXXXXXXXXX</code>",
+            parse_mode="HTML",
+        )
+
+
 
 def main() -> None:
     """Start the bot."""
@@ -390,6 +538,7 @@ def main() -> None:
             TITLE:  [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_title)],
             AUTHOR: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_author)],
             PAGES:  [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_pages)],
+            MODE:   [CallbackQueryHandler(receive_mode, pattern="^antiai_(on|off)$")],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         allow_reentry=True,
@@ -397,6 +546,13 @@ def main() -> None:
 
     app.add_handler(conv_handler)
     app.add_handler(CommandHandler("help", help_command))
+    # Owner commands
+    app.add_handler(CommandHandler("genkey", cmd_genkey))
+    app.add_handler(CommandHandler("keys", cmd_keys))
+    app.add_handler(CommandHandler("delkey", cmd_delkey))
+    # User commands
+    app.add_handler(CommandHandler("redeem", cmd_redeem))
+    app.add_handler(CommandHandler("premium", cmd_premium))
     app.add_error_handler(error_handler)
 
     logger.info("🚀 IEEE Paper Generator Bot is running...")

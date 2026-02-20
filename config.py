@@ -7,6 +7,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 APIMART_API_KEY = os.getenv("APIMART_API_KEY")
 AI_MODEL = os.getenv("AI_MODEL", "gemini-3-pro-preview")
 APIMART_BASE_URL = os.getenv("APIMART_BASE_URL", "https://api.apimart.ai/v1")
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN is not set in .env")
